@@ -1,0 +1,464 @@
+#!/usr/bin/env groovy
+
+properties([
+
+        parameters([
+                booleanParam(name: 'doBuild', defaultValue: true, description: ''),
+                booleanParam(name: 'doDeploy', defaultValue: false, description: ''),
+                string(name: 'dockerTagParam', defaultValue: '', description: 'Docker tag value'),
+                string(name: 'componentName', defaultValue: '', description: 'The name of the component to build'),
+                string(name: 'dockerRepo', defaultValue: '', description: 'The path of Docker folder')
+        ]),
+
+        [
+                $class: 'BuildDiscarderProperty',
+                strategy: [$class: 'LogRotator', numToKeepStr: '3']
+        ],/*
+    pipelineTriggers([cron('H/2 * * * *')]),
+    */
+        // Trigger every 2 minutes
+        pipelineTriggers([
+                triggers: [
+                        [
+                                $class: 'hudson.triggers.SCMTrigger',
+                                scmpoll_spec : 'H/15 * * * *'
+                        ]
+                ]
+        ])
+])
+
+node {
+
+    def COLOR = [RED:'#FF0000', YELLOW:'#FFFF00', GREEN:'#00FF00']
+    // The web hook for deployment to dev/int and this is the default web hook
+    def MATTERMOST_HOOK = 'https://matter.i.daimler.com/hooks/ajnzk8dt7truicqxurfwqf35bw'
+    def project = 'MBTC'
+    // Extract componentName from jenkions JOB_NAME (ccb/ccb-converter)
+    //componentName ="ccb-converter"
+    def componentName = env.JOB_NAME.split("/")[1]
+    def subComponentName
+    // def feSvcName = "${componentName}-frontend"
+    // def imageTag = "reg-dhc.app.corpintra.net/${project}/${componentName}:${env.BRANCH_NAME}.${env.BUILD_NUMBER}"
+    def versionTag
+    def branchTag
+    def nameTag
+    def imageTag
+    def environment
+    def componentScript
+    def logger
+    def subProject
+
+
+    stage('prepare') {
+        branchTag = env.BRANCH_NAME
+        echo 'Start Build of some epic sh...'
+        env.MATTERMOST_HOOK = MATTERMOST_HOOK
+
+        // Print all Jenkins environment variables
+        // echo sh(returnStdout: true, script: 'env')
+
+        if (componentName.isEmpty()) {
+            error('No componentName specified!')
+        } else if(componentName.contains("converter") || componentName.contains("uploader")){
+            //ccb is the git project name hence componentName should be ccb
+            // subproject name is fetched from the job name eg converter or uploader
+            subProject = componentName.split("-")[1]
+            componentName = "ccb"
+            //ccb is the folder inside ccb git project hence subcomponentName should be ccb/ccb
+            subComponentName ="ccb/ccb"
+
+        } else if (componentName.contains("gateway")) {
+            //ccb-gateway is the git project name hence componentName should be ccb-gateway
+            subComponentName = componentName
+            //folder inside  ccb-gateway to be used for building is "mbuptime-gateway"
+            subProject = "mbuptime-gateway"
+        } else if (componentName.contains("kubernetes")) {
+            //subComponentName is ccb-kubernetes
+            subComponentName = componentName
+            doDeploy = false
+        } else {
+            //subComponentName is ccb-kubernetes
+            // for ccb-moniotring : monitoring ,
+            // for ccb-prometheus-configs :subProject = "prometheus-configs"
+            subProject = componentName.split("-")[1]
+            componentName = "ccb-kubernetes"
+            subComponentName = componentName
+            branchTag = "develop"
+
+        }
+
+        echo "Branch name: ${env.BRANCH_NAME}"
+
+        // Extract commit SHA
+        env.COMMIT_SHA = readCommitSHA(project, componentName, env.BRANCH_NAME)
+
+        echo "Commmit SHA is:  ${env.COMMIT_SHA}"
+
+        // For development we use the COMMIT_SHA is ID
+        versionTag = env.COMMIT_SHA
+
+        if(!dockerTagParam.isEmpty()) {
+            versionTag = dockerTagParam
+        }
+        environment = "development"
+
+            // For release/* branch we extract the version from the branch name
+        if(env.BRANCH_NAME.contains("master")) {
+
+            // REMOVED! For production we checkout the latest version
+            // versionTag = readLatestVersionTag(project, componentName)
+            // branchTag = "tags/v${versionTag}"
+            environment = "production"
+            // The web hook for deployment to production
+            MATTERMOST_HOOK = 'https://matter.i.daimler.com/hooks/wbepkqnir7g6jppigt4ijrd4yh'
+        }else if (env.BRANCH_NAME.contains("int")) {
+            doDeploy = true
+            environment = "int"
+            // REMOVED! For production we search for the latest version tag
+            // Just us production branch like on the other environments
+        } else {
+            doDeploy = true
+        }
+
+        env.MATTERMOST_HOOK = MATTERMOST_HOOK
+        sendMattermost(
+            "Build started (${componentName})",
+            getVersionString(versionTag, environment),
+            COLOR.GREEN
+        )
+
+        // mattermostSend(
+        //     color: "#439FE0",
+        //     message: "Build Started: ${env.JOB_NAME} ${env.BUILD_NUMBER}"
+        // )
+
+        echo "Tag is: ${versionTag}"
+    }
+
+    stage('checkout') {
+
+
+        checkoutModule(project, componentName, branchTag)
+        nameTag = componentName +":"+ versionTag
+        echo "name tag ${nameTag}"
+        imageTag = "reg-dhc.app.corpintra.net/mbuptime/${nameTag.replaceAll("/", "-")}"
+        echo "Image tag is: ${imageTag}"
+
+        def type
+        // Check which type of project we have to build
+        if (!componentName.contains("kubernetes")) {
+            type = "java"
+        } else   {
+            type = "config"
+        }
+
+        def rootDir = pwd()
+        componentScript = load "${rootDir}/ccb-deployment/build_${type}.groovy"
+    }
+
+    stage('build') {
+        if(doBuild.toString()=='true') {
+            withEnv(['HTTP_PROXY=http://security-proxy.emea.svc.corpintra.net:3128','HTTPS_PROXY=http://security-proxy.emea.svc.corpintra.net:3128']) {
+
+                if (!componentName.contains("kubernetes")) {
+
+                    componentScript.logger = new Logger(this)
+                    try {
+                        componentScript.doBuild(project, subComponentName, subProject, environment, imageTag)
+                    } catch (Exception e) {
+                        sendMattermost(
+                        "Build failed (${componentName})",
+                        getVersionString(versionTag, environment) +"\n\n"+ getChangeString() +"\n\n```\n"+ componentScript.logger.getLog() +"\n```",
+                        COLOR.RED
+                    )
+
+                        error(e.getMessage())
+                    }
+                }
+            }
+        }
+    }
+
+
+
+ stage('deploy') {
+        if(doDeploy.toString()=='true') {
+            componentScript.logger = new Logger(this)
+
+            if (env.BRANCH_NAME.contains("master")) {
+                timeout(time: 5, unit: 'MINUTES') { // change to a convenient timeout for you
+                    deploy = input(message: 'Deploy to production?')
+                }
+            }
+            def tillerNamespace = "mbuptime-dev"
+            if (environment == 'int') {
+                tillerNamespace = "mbuptime-int"
+            } else if (environment == 'production') {
+                tillerNamespace = "mbuptime-prod"
+            }
+
+            if (subProject == 'ingress') {
+                tillerNamespace = "ingress-ccb"
+            }
+
+
+
+            initHelm(environment, tillerNamespace)
+
+            try {
+                if(dockerRepo.isEmpty()) {
+                     componentScript.doDeploy(project, componentName, subProject, environment, versionTag)
+                 } else {
+                     componentScript.doDeploy(project, componentName, subProject, environment, dockerRepo, dockerTagParam )
+                 }
+
+            } catch (Exception e) {
+                sendMattermost(
+                "Deploy failed (${componentName})",
+                getVersionString(versionTag, environment) +"\n\n"+ getChangeString() +"\n\n```\n"+ getLastNLogChars(componentScript.logger, 5000) +"\n```",
+                COLOR.RED
+            )
+
+                error(e.getMessage())
+            }
+          sendMattermost(
+            "Deploy successfull (${componentName})",
+            getVersionString(versionTag, environment) +"\n\n"+ getChangeString() +"\n\n```\n"+ getLastNLogChars(componentScript.logger, 5000) +"\n```",
+            COLOR.GREEN
+        )
+        }
+    }
+
+    stage('postdeploy') {
+        if(doDeploy.toString()=='true') {
+
+            componentScript.logger = new Logger(this)
+
+            componentScript.doPostDeploy(project, componentName, subProject, imageTag, environment, versionTag)
+        }
+    }
+}
+
+def getLastNLogChars(Logger logger, int numberOfChars) {
+    def text = logger.getLog();
+    def result
+
+    if (text != null && text.length() > numberOfChars) {
+        result = text.substring(text.length() - numberOfChars, text.length() -1)
+    } else {
+        result = text;
+    }
+    return result;
+}
+
+def readCommitSHA(String project, String componentName, String branchTag) {
+
+    def commitSHA
+
+    withCredentials([[
+                             $class: 'UsernamePasswordMultiBinding',
+                             credentialsId: 'jenkins_build_token',
+                             usernameVariable: 'USERNAME',
+                             passwordVariable: 'PASSWORD']]) {
+
+        commitSHA = sh(
+                script: "git ls-remote https://$USERNAME:${java.net.URLEncoder.encode(PASSWORD)}@git.daimler.com/${project}/${componentName}.git refs/heads/${branchTag} | awk '{print \$1}'",
+                returnStdout: true).trim()
+    }
+
+    return commitSHA
+}
+
+def readLatestVersionTag(String project, String componentName) {
+
+    def versionTag
+
+    withCredentials([[
+                             $class: 'UsernamePasswordMultiBinding',
+                             credentialsId: 'jenkins_build_token',
+                             usernameVariable: 'USERNAME',
+                             passwordVariable: 'PASSWORD']]) {
+
+        // Returns refs/tags/v0.1.0
+        versionTag = sh(
+                script: "git ls-remote --tags --refs https://$USERNAME:${java.net.URLEncoder.encode(PASSWORD)}@git.daimler.com/${project}/${componentName}.git v\\* | awk '{print \$2}' | sort | tail -1",
+                returnStdout: true).trim()
+
+        echo "versionTag: ${versionTag}"
+
+        if (!versionTag.startsWith("refs/tags/v")) {
+            error("Could not obtain latest version tag: ${versionTag}")
+        }
+
+        versionTag = versionTag.replaceAll("refs/tags/v", "")
+    }
+
+    return versionTag
+}
+
+def checkoutModule(String project, String componentName, String branchTag) {
+
+    echo "Checkout from SCM for: ${componentName}"
+
+    dir(componentName) {
+
+        echo "Checkout ${branchTag}"
+
+        checkout(
+                [
+                        $class: 'GitSCM',
+                        //branches: [[name: "refs/remotes/origin/"+ branchTag]],
+                        branches: [[name: branchTag.startsWith("tags/") ? branchTag : "origin/"+ branchTag]],
+                        // branches: scm.branches,
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                                // [$class: 'LocalBranch', localBranch: "**"],
+                                [$class: 'MessageExclusion', excludedMessage: '(?s)^\\[DOC\\] Robot.*'],
+                                [$class: 'SubmoduleOption', parentCredentials: true]
+                        ],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[credentialsId: 'jenkins_build_token', url: "https://git.daimler.com/${project}/${componentName}.git"]]
+                ]
+        )
+    }
+    // Checkout environment code
+    if (componentName != 'ccb-deployment') {
+        dir('ccb-deployment') {
+            checkout(
+                    [
+                            $class: 'GitSCM',
+                            poll: false,
+                            changelog: false,
+                            branches: [[name: "refs/remotes/origin/"+ env.BRANCH_NAME]],
+                            clean: true,
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions: [
+                                    [$class: 'DisableRemotePoll'],
+                                    [$class: 'PathRestriction', excludedRegions: '.*'],
+                                    [$class: 'LocalBranch', localBranch: "**"]
+                            ],
+                            submoduleCfg: [],
+                            userRemoteConfigs: [[credentialsId: 'jenkins_build_token', url: "https://git.daimler.com/${project}/ccb-deployment.git"]]
+                    ]
+            )
+        }
+    }
+}
+
+def initHelm(String environment, String tillerNamespace) {
+
+    // Check if registry plugin already exists, otherwhise unpack it
+    if (!fileExists(".helm/")) {
+        try {
+            def kubeSecretName = 'CCB_Kubecfg_INT'
+            if (environment == 'production') {
+                kubeSecretName = 'CCB_Kubecfg_PROD'
+            }
+            sh "mkdir $env.WORKSPACE/.helm/"
+            sh "tar -zxf ccb-deployment/k8s/helm/helm_init.tar.gz -C $env.WORKSPACE/.helm/"
+            withCredentials([file(credentialsId: kubeSecretName, variable: 'kubecfg')]) {
+                echo "kubeconfig:  $kubecfg"
+                sh "helm init --upgrade --home $env.WORKSPACE/.helm --kubeconfig $kubecfg --override \"spec.template.spec.containers[0].args={/tiller,--listen=localhost:44134},spec.template.spec.securityContext.runAsUser=1234\" --tiller-image reg-dhc.app.corpintra.net/i3/gcr.io-kubernetes_helm-tiller:v2.11.0 --tiller-namespace ${tillerNamespace} --service-account i3-helm --history-max 5"
+            }
+        } catch (e) {
+            echo "Error setup of helm failed (${e.getMessage()})"
+        }
+    }
+}
+
+def sendMattermost(String message, String text, String color) {
+
+    text = text.replaceAll("\"", "\\\\\"")
+    text = text.replaceAll("\\x1b", "") // Replace ESCAPE character
+
+    def body = "{"+
+            "\"attachments\": [{"+
+            "\"color\": \"${color}\","+
+            "\"mrkdwn_in\": [\"pretext\", \"text\", \"fields\"],"+
+            "\"fields\": [{"+
+            "\"short\": false,"+
+            "\"value\": \"${text}\""+
+            "}],"+
+            "\"fallback\": \"fallback text\""+
+            "}],"+
+            "\"text\": \"${message}\""+
+            "}"
+
+    try {
+        def httpProxy = null
+        if (System.properties["http.proxyHost"] != null) {
+            httpProxy = "http://${System.properties["http.proxyHost"]}:${System.properties["http.proxyPort"]}"
+        }
+
+        httpRequest(
+                url: env.MATTERMOST_HOOK,
+                contentType: 'APPLICATION_JSON',
+                httpMode: 'POST',
+                // requestBody: "{\"text\": \"${message}\"}"
+                requestBody: body,
+                httpProxy: httpProxy
+        )
+    } catch (e) {
+        echo "Could not send message to mattermost: ${body}"
+    }
+}
+
+def String getVersionString(String versionTag, String environment) {
+    def markdownString = "| Job | Branch | Build | Version | Environment \n"
+    markdownString += "|-----|--------------|-----|-----------------------|-------------| \n"
+    markdownString += "| ${env.JOB_NAME} | ${env.BRANCH_NAME} | ${env.BUILD_NUMBER} | ${versionTag} | ${environment} | \n"
+    return markdownString
+}
+
+@NonCPS
+def getChangeString() {
+    MAX_MSG_LEN = 100
+    def changeString = ""
+
+    echo "Gathering SCM changes"
+    def changeLogSets = currentBuild.changeSets
+    echo "currentBuild.changeSets: " + currentBuild.changeSets
+    def counter = 0
+
+    changeLogSets.each { item ->
+        // Usally the second repo does only contain changes from xxx-deployment
+        if(counter == 1) {
+            return true
+        }
+        counter++
+        item.each { entry ->
+            truncated_msg = entry.msg.take(MAX_MSG_LEN)
+            def commitId = entry.commitId
+            if (commitId && commitId.length() >= 8) {
+                commitId = commitId.substring(0, 8)
+            }
+            if (!truncated_msg.startsWith("[DOC]")) {
+                changeString += "* ${commitId} ${truncated_msg} [${entry.author}] \n"
+            }
+        }
+    }
+}
+class Logger {
+    def script
+    def String log = null
+
+    Logger(def script) {
+        this.script = script
+    }
+
+    void log(String message) {
+        script.echo(message)
+        if(log == null) {
+            log = "";
+        } else {
+            log += "\n";
+        }
+        log += message
+    }
+
+    void clean() {
+        log = null;
+    }
+}
+
+
