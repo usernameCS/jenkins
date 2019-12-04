@@ -1,0 +1,86 @@
+def getRepoURL() {
+  sh "git config --get remote.origin.url > .git/remote-url"
+  return readFile(".git/remote-url").trim()
+}
+def getCommitSha() {
+  sh "git rev-parse HEAD > .git/current-commit"
+  return readFile(".git/current-commit").trim()
+}
+def uniqueImageName() {
+  return sh(returnStdout: true, script: 'git branch | sed -n -e "s/^\\* \\(.*\\)/\\1/p" | rev | cut -d "/"  -f 1 | rev')
+}
+// setBuildStatus sets a status item on a GitHub commit
+def setBuildStatus = { String url, String commitSha, String message, String state  ->
+  step([
+    $class: "GitHubCommitStatusSetter",
+    reposSource: [$class: "ManuallyEnteredRepositorySource", url: url ],
+    commitShaSource: [$class: "ManuallyEnteredShaSource", sha: commitSha],
+    errorHandlers: [[$class: "ChangingBuildStatusErrorHandler", result: "UNSTABLE"]],
+    statusResultSource: [ $class: "ConditionalStatusResultSource", results: [
+        [$class: "AnyBuildResult", message: message, state: state]] ]
+  ]);
+}
+
+def repoUrl=""                   
+def commitSha=""     
+
+try { // Use a try block to perform cleanup in a finally block when the build fails
+  node('dot-playground') {
+    stage('Pull GitHub Repo') { 
+      git branch: env.BRANCH_NAME, credentialsId: 'github_read', url: "https://git.daimler.com/dot-playground/dot-playground-artplay.git" 
+      // get sha after checkout
+      repoUrl = getRepoURL()
+      uniqueImageName = uniqueImageName()      
+      commitSha = getCommitSha()      
+    }
+    stage('Login DHC') {
+      setBuildStatus(repoUrl, commitSha, "Login to DHC", "PENDING")
+      sh "./00-infra/reg-dhc/reg-dhc-docker-login.sh"
+    }
+    stage('Setting up K8S Basic Infrastructure') {
+      sh "./00-infra/dot-basic-setup/kubectl.sh apply"
+    }    
+    stage('Scan with SonarQube') {
+      setBuildStatus(repoUrl, commitSha, "Scan with SonarQube", "PENDING")
+      sh "cd ./40-code/ && ./sonar-pipeline.sh ${uniqueImageName}"
+    }  
+    stage('Build Unique Docker Image') {
+      setBuildStatus(repoUrl, commitSha, "Build Unique Docker Image", "PENDING")
+      sh "cd ./40-code/ && ./build-pipeline.sh ${uniqueImageName}"
+    }
+    stage('Deploy Docker to DHC') {
+      setBuildStatus(repoUrl, commitSha, "Deploy Docker to DHC", "PENDING")
+      sh "./00-infra/dot-deployment/kubectl.sh apply ${uniqueImageName}"
+    }
+    stage('Unique URI') {
+      println "Your unique deployment URI: https://bouncycaastle.app.corpintra.net/${uniqueImageName}"
+      setBuildStatus(repoUrl, commitSha, "Deployed: https://bouncycaastle.app.corpintra.net/${uniqueImageName}", "SUCCESS")
+    }  
+  }
+}
+catch(all) {
+  node {
+    stage('GitHub Error Status') {
+      repoUrl = getRepoURL()
+      commitSha = getCommitSha()
+      setBuildStatus(repoUrl, commitSha, "Error in Pipeline", "FAILURE")
+      script {
+        properties([[$class: 'GithubProjectProperty', projectUrlStr: "${repoUrl}"]])
+      }
+      step([$class: 'GitHubIssueNotifier', 
+            issueAppend: false, issueBody: '''
+            Build \'$JOB_NAME\' has failed!
+            
+            Last 50 lines of output are:
+            
+            ```
+            ${OUTPUT, lines=50}
+            ```
+            
+            [View full output]($BUILD_URL)''', 
+            issueLabel: 'Urgency-High', 
+            issueRepo: '<a repo>', 
+            issueTitle: '$JOB_NAME $BUILD_DISPLAY_NAME failed'])      
+    }
+  }
+}
